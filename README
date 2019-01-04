@@ -1,0 +1,21 @@
+USAGE: scrawl [MODE] [OPTIONS]
+Quickly make and dump tagged temporary files.
+Each entry is identified by an integer and zero or more tags.
+By default identifiers are the current Unix time.
+
+MODES
+  -A [TAG ...]    | add     | Add new entry with given tags.
+  -L [TAG ...]    | list    | List indexed info of matching entries.
+  -G INDEX        | get     | Output entry at given index.
+  -T              | tags    | List all tags in matching entries.
+
+OPTIONS
+  -a [UNIXTIME] | after   | Filter entries by IDs after the given unix time.
+  -b [UNIXTIME] | before  | Filter entries by IDs before the given unix time.
+  -d [UNIXTIME] | day     | Filter entries by ID 12h before and after the given unix time.
+  -i INTEGER    | id      | Filter entries or make a new entry with the given ID.
+  -r            | reverse | Reverse entry ID sort order.
+  -s            | simple  | Output only the file name of matching entries.
+  -t TAG_STRING | tag     | Filter entries or make a new entry with the given tag.
+
+Mike Lalumiere 2017 - GPLv3

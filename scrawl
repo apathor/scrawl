@@ -1,0 +1,297 @@
+#!/bin/bash
+# scrawl - Quick temporary files.
+
+scrawl() {
+    # usage string
+    read -r -d '' use <<EOF
+USAGE: scrawl [MODE] [OPTIONS]
+Quickly make and dump tagged temporary files.
+Each entry is identified by an integer and zero or more tags.
+By default identifiers are the current Unix time.
+
+MODES
+  -A [TAG ...]    | add     | Add new entry with given tags.
+  -L [TAG ...]    | list    | List indexed info of matching entries.
+  -G INDEX        | get     | Output entry at given index.
+  -T              | tags    | List all tags in matching entries.
+
+OPTIONS
+  -a [UNIXTIME] | after   | Filter entries by IDs after the given unix time.
+  -b [UNIXTIME] | before  | Filter entries by IDs before the given unix time.
+  -d [UNIXTIME] | day     | Filter entries by ID 12h before and after the given unix time.
+  -i INTEGER    | id      | Filter entries or make a new entry with the given ID.
+  -r            | reverse | Reverse entry ID sort order.
+  -s            | simple  | Output only the file name of matching entries.
+  -t TAG_STRING | tag     | Filter entries or make a new entry with the given tag.
+
+Mike Lalumiere 2017 - GPLv3
+EOF
+
+    # working directory must exist and be writable
+    declare sdir="${SCRAWL_DIR:-$HOME/.scrawl}"
+    sdir="${sdir%%/}"
+    if ! mkdir -p "$sdir" || ! [ -w "$sdir" ]; then
+        printf "%s\n" "Could not make or write to directory $sdir!" >&2
+        return 1
+    fi
+
+    # record the current time
+    local now="$(printf "%(%s)T\n")"
+
+    # declare regular expressions
+    declare _int='^[0-9]+$'               # INTEGER
+    declare _pos='^[+-]?[0-9]+$'          # +/-INTEGER
+    declare _tag='^[a-Z0-9]+$'            # TAG
+    declare _mine='^[0-9]+(_[a-Z0-9]+)*$' # INTEGER(_TAG)*
+
+    # accept options
+    declare mode id reverse simple after before given
+    declare -a tags
+    while getopts ":AGHLTa:b:hi:rst:" opt; do
+        case "$opt" in
+            # modes
+            H|h) ## help
+                mode="help" ;;
+            A)  ## add [ TAG ... ]
+                mode="add"  ;;
+            G)  ## get INDEX
+                mode="get"  ;;
+            L)  ## list
+                mode="list" ;;
+            T)  ## tags
+                mode="tags" ;;
+            # options
+            a) ## future - select entries with IDs after now
+                after="$OPTARG"
+                if ! [[ "$after" =~ $_int ]]; then
+                    printf "After filter be an integer Unix time.\n" >&2
+                    return 2
+                fi
+                ;;
+            b) ## past - select entries with IDs before now
+                before="$OPTARG"
+                if ! [[ "$before" =~ $_int ]]; then
+                    printf "Before filter must be an integer Unix time.\n" >&2
+                    return 2
+                fi
+                ;;
+            d) ## day - select entries with IDs within today's epoch day
+                given="$OPTARG"
+                if ! [[ "$given" =~ $_int ]]; then
+                    printf "Day filter must be an integer Unix time.\n" >&2
+                    return 2
+                fi
+                after="$(( given - (86400 / 2) ))"
+                before="$(( given + (86400 / 2) ))"
+                ;;
+            i) ## id INTEGER - select entries with given ID
+                id="$OPTARG"
+                if ! [[ "$id" =~ $_int ]]; then
+                    printf "Entry ID must be an integer.\n" >&2
+                    return 2
+                fi
+                ;;
+            r) ## reverse - reverse sort of entries
+                reverse="YES"
+                ;;
+            s) ## simple - just print the path of selected entries
+                simple="YES"
+                ;;
+            t) ## tag TAG_STRING - select entries with given tag ( multiple accepted )
+                if ! [[ "$OPTARG" =~ $_tag ]]; then
+                    printf "Invalid tag '%s'.\n" "$OPTARG" >&2
+                    return 2
+                fi
+                tags+=("$OPTARG")
+                ;;
+            # optional option arguments
+            :)
+                case "$OPTARG" in
+                    a) # after now
+                        after="$now"
+                        ;;
+                    b) # before now
+                        before="$now"
+                        ;;
+                    d) # day around now
+                        after="$(( now - (86400 / 2) ))"
+                        before="$(( now + (86400 / 2) ))"
+                        ;;
+                    *) # unknown
+                        printf "Missing required argument for option '%s'!\n%s\n" "$OPTARG" "$use" >&2
+                        return 1
+                        ;;
+                esac
+                ;;
+            # unexpected
+            \?)
+                printf "Invalid option '%s'!\n%s\n" "$OPTARG" "$use" >&2
+                return 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+
+    # guess the program mode if one was not given
+    if [ -z "$mode" ]; then
+        if ! [ -t 0 ]; then mode="add"
+        elif [ "$#" -eq 1 ] && [[ "$1" =~ $_int ]]; then mode="get"
+        elif [ "$#" -gt 0 ] || [ "${#tags[@]}" -gt 0 ]; then mode="list"
+        else mode="help"
+        fi
+    fi
+
+    # some modes accept any additional arguments as tags
+    if [ "$mode" == "add" ] || [ "$mode" == "list" ]; then
+        while [ -n "$1" ]; do
+            if ! [[ "$1" =~ $_tag ]]; then
+                printf "Invalid tag '%s'.\n" "$1" >&2
+                return 3
+            fi
+            tags+=("$1")
+            shift
+        done
+    fi
+
+    # some modes filter existing entries
+    declare -a hits
+    local len
+    if [ "$mode" == "get" ] || [ "$mode" == "list" ]; then
+        # consider each file in the working directory
+        for file in "$sdir"/*; do
+            # parse filename
+            local base="${file##*/}"
+            # skip files that dont match the format
+            if ! [[ "$base" =~ $_mine ]]; then continue; fi
+            # parse filename
+            IFS='_' read i t <<< "$base"
+            # filter by time selection
+            if [ -n "$id" ] && [ "$i" != "$id" ]; then continue; fi
+            if [ -n "$after"  ] && [ "$i" -lt "$after"  ]; then continue; fi
+            if [ -n "$before" ] && [ "$i" -gt "$before" ]; then continue; fi
+            # filter by tag
+            local found=0
+            for etag in ${t//_/ }; do
+                for wtag in "${tags[@]}"; do
+                    if [ "${wtag,,}" == "${etag,,}" ]; then found=1; fi
+                done
+            done
+            if [ "${#tags[@]}" -ne 0 ] && [ "$found" -ne 1 ]; then continue 2; fi
+            # push matching files
+            hits+=("$file")
+        done
+
+        # record number of hits
+        len="${#hits[@]}"
+
+        # maybe reverse order of results
+        if [ -n "$reverse" ]; then
+            declare -a revs
+            for ((i="$len" - 1; i >= 0; i--)); do revs+=("${hits[$i]}"); done
+            hits=("${revs[@]}")
+        fi
+    fi
+
+    # select program mode
+    case "$mode" in
+        # help - write some usage text
+        help)
+            printf "%s\n" "$use"
+            return 0
+            ;;
+        # add - make a new entry
+        add)
+            # generate file name
+            path="${sdir}/${id:-$now}"
+            if [ "${#tags[@]}" -gt 0 ]; then
+                path+="$(printf '_%s' "${tags[@]}")";
+            fi
+            path="${path,,}"
+            # nothing on stdin?
+            if [ -t 0 ]; then
+                # edit interactively
+                eval "${EDITOR:-/bin/nano} $path"
+            else
+                # validate input file
+                if [ -d /dev/stdin ]; then
+                    printf "Input is a directory?\n" >&2
+                    return 3
+                fi
+                # write input out to entry
+                while read -r line; do printf "%s\n" "$line"; done > "$path"
+            fi
+            # write out file path
+            if [ -f "$path" ]; then printf "%s\n" "$path"; fi
+            ;;
+        # get - show file with given index
+        get)
+            # maybe nothing was found
+            if [ "${len:-0}" -lt 1 ]; then
+                printf "No entries found!\n" >&2
+                return 2
+            fi
+            # accept integer index
+            declare pick="${1:-0}"
+            if ! [[ "$pick" =~ $_pos ]]; then
+                printf "Get index must be +/- integer.\n" >&2
+                return 2
+            fi
+            if [ "${pick#-}" -gt "$(( len - 1 ))" ]; then
+                printf "Max index is %s!\n" "$(( len - 1 ))" >&2
+                return 2
+            fi
+            # write out file path or its contents
+            if [ -n "$simple" ]; then
+                echo "${hits[$pick]}"
+            else
+                echo "${hits[$pick]}" >&2
+                while read -r line; do printf "%s\n" "$line"; done < "${hits[$pick]}"
+            fi
+            ;;
+        # list - list matching entries
+        list)
+            # maybe nothing was found
+            if [ "${len:-0}" -lt 1 ]; then
+                printf "No entries found!\n" >&2
+                return 2
+            fi
+            declare index="0"
+            for hit in "${hits[@]}"; do
+                if [ -n "$simple" ]; then
+                    # simple format: FILENAME
+                    printf "%s\n" "$hit"
+                else
+                    # default format: INDEX ID TIMESTAMP SIZE PREVIEW
+                    declare len info
+                    # parse file name for normal output
+                    file="${hit##*/}"
+                    IFS='_' read id tags <<< "$file"
+                    # render entry info
+                    stamp="$(printf '%(%F %T)T' "$id")"
+                    size="1"
+                    printf "% 3d %d %s %s %s %s\n" \
+                           "$index" "$id" "$stamp" "$size" "${tags//_/,}"
+                fi
+                # increment index
+                let index++;
+            done
+            ;;
+        # tags - list tags in matching entries
+        tags)
+            declare -A all
+            for hit in "${hits[@]}"; do
+                IFS='_' read -r -a t <<< "$hit"
+                for t in "${t[@]:1}"; do all["${t,,}"]+=1; done
+            done
+            printf "%s\n" "${!all[@]}" | sort
+            ;;
+
+        *) # something else?
+            printf "Invalid mode '%s'. How did that happen?" "$mode" >&2
+            return 5
+            ;;
+    esac
+    return 0;
+}
+# run it unless sourced
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then scrawl "$@"; fi
