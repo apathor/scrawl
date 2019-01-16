@@ -185,7 +185,7 @@ EOF
         len="${#hits[@]}"
 
         # maybe reverse order of results
-        if [ -n "$reverse" ]; then
+        if [ -z "$reverse" ]; then
             declare -a revs
             for ((i="$len" - 1; i >= 0; i--)); do revs+=("${hits[$i]}"); done
             hits=("${revs[@]}")
