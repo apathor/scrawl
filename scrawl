@@ -1,16 +1,18 @@
 #!/bin/bash
-# scrawl - Quick temporary files.
+# scrawl - Tagged temporary files.
 
 scrawl() {
-    # usage string
+    # usage
     read -r -d '' use <<EOF
 USAGE: scrawl [MODE] [OPTIONS]
-Quickly make and dump tagged temporary files.
+Create and manipulate tagged temporary files.
 Each entry is identified by an integer and zero or more tags.
-IDs are the current Unix time by default but can be any integer.
+IDs are the current epoch time by default but can be any integer.
 
 MODES
   -A [TAG ...]       | add     | Add new entry with given tags.
+  -D [TAG ...] INDEX | delete  | Delete entry at given index of matching entries.
+  -E [TAG ...] INDEX | edit    | Edit entry at given index of matching entries.
   -G [TAG ...] INDEX | get     | Output entry at given index of matching entries.
   -L [TAG ...]       | list    | List indexed info of matching entries.
   -T [TAG ...]       | tags    | List all tags in matching entries.
@@ -19,6 +21,7 @@ OPTIONS
   -a [UNIXTIME] | after   | Filter entries by IDs after the given unix time.
   -b [UNIXTIME] | before  | Filter entries by IDs before the given unix time.
   -d [UNIXTIME] | day     | Filter entries by ID 12h before and after the given unix time.
+  -e            | encrypt | Encrypt a file with PGP.
   -i INTEGER    | id      | Filter entries or make a new entry with the given ID.
   -r            | reverse | Reverse entry ID sort order.
   -s            | simple  | Output only the file name of matching entries.
@@ -36,12 +39,10 @@ EXAMPLES
  # List entries
   $ scrawl -L -t baz
   $ scrawl -L -s foo | parallel grep -l ietf
-  $ scrawl -Ls -d \$(date +%s) | xargs rm -v
+  $ scrawl -Ls -d 1572047858 | xargs rm -v
 
  # List tags
   $ scrawl -T foo
-
-Mike Lalumiere 2017 - GPLv3
 EOF
     # working directory must exist and be writable
     declare sdir="${SCRAWL_DIR:-$HOME/.scrawl}"
@@ -51,14 +52,17 @@ EOF
         return 1
     fi
     # record the current time
-    local now="$(printf "%(%s)T\n")"
-    # declare regular expressions
-    declare _int='^[0-9]+$'                    # INTEGER
-    declare _pos='^[+-]?[0-9]+$'               # +/-INTEGER
-    declare _tag='^[a-Z][a-Z0-9]*$'            # TAG
-    declare _mine='^[0-9]+(_[a-Z][a-Z0-9]+)*$' # INTEGER(_TAG)*
+    local now
+    now=$(printf "%(%s)T\n")
+    # local
+    local editor="${EDITOR:-/usr/bin/sensible-editor}"
+    # regular expressions
+    local _int='^[0-9]+$'                                   # INTEGER
+    local _pos='^[+-]?[0-9]+$'                              # +/-INTEGER
+    local _tag='^[a-Z][a-Z0-9]*$'                           # TAG
+    local _mine='^[0-9]+(_[a-Z][a-Z0-9]+)*([.][a-Z0-9]+)*$' # INTEGER(_TAG)*
     # declare some variables
-    declare mode exact reverse simple after before given
+    local mode exact reverse simple after before given encrypt
     declare -a wtags
     # guess the program mode
     if ! [ -t 0 ]; then
@@ -75,42 +79,43 @@ EOF
         mode="help"
     fi
     # accept options
-    while getopts ":AGHLTa:b:d:hi:rst:" opt; do
+    local opt OPTIND OPTARG
+    while getopts ":ADEGHLTa:b:d:ehi:rst:" opt; do
         case "$opt" in
             # modes
-            H|h) ## help
-                mode="help" ;;
-            A)  ## add [ TAG ... ]
-                mode="add"  ;;
-            G)  ## get INDEX
-                mode="get"  ;;
-            L)  ## list
-                mode="list" ;;
-            T)  ## tags
-                mode="tags" ;;
+            H|h) mode="help"   ;;
+            A)   mode="add"    ;;
+            D)   mode="delete" ;;
+            E)   mode="edit"   ;;
+            G)   mode="get"    ;;
+            L)   mode="list"   ;;
+            T)   mode="tags"   ;;
             # options
             a) ## future - select entries with IDs after now
                 after="$OPTARG"
                 if ! [[ "$after" =~ $_int ]]; then
-                    printf "After filter be an integer Unix time.\n" >&2
+                    printf "After filter be an integer epoch time.\n" >&2
                     return 2
                 fi
                 ;;
             b) ## past - select entries with IDs before now
                 before="$OPTARG"
                 if ! [[ "$before" =~ $_int ]]; then
-                    printf "Before filter must be an integer Unix time.\n" >&2
+                    printf "Before filter must be an integer epoch time.\n" >&2
                     return 2
                 fi
                 ;;
             d) ## day - select entries with IDs within today's epoch day
                 given="$OPTARG"
                 if ! [[ "$given" =~ $_int ]]; then
-                    printf "Day filter must be an integer Unix time.\n" >&2
+                    printf "Day filter must be an integer epoch time.\n" >&2
                     return 2
                 fi
                 after="$(( given - (86400 / 2) ))"
                 before="$(( given + (86400 / 2) ))"
+                ;;
+            e) ## encrypt
+                encrypt="YES"
                 ;;
             i) ## id INTEGER - select entries with given ID
                 exact="$OPTARG"
@@ -132,8 +137,7 @@ EOF
                 fi
                 wtags+=("$OPTARG")
                 ;;
-            # optional option arguments
-            :)
+            :) # some options have optional arguments
                 case "$OPTARG" in
                     a) # after now
                         after="$now"
@@ -151,7 +155,7 @@ EOF
                         ;;
                 esac
                 ;;
-            # unexpected
+            # an unexpected option was provided
             \?)
                 printf "Invalid option '%s'!\n%s\n" "$OPTARG" "$use" >&2
                 return 1
@@ -168,7 +172,7 @@ EOF
     # some modes filter existing entries
     declare -a hits
     local len
-    if [ "$mode" == "get" ] || [ "$mode" == "list" ] || [ "$mode" == "tags" ]; then
+    case "$mode" in get|edit|delete|list|tags)
         # consider each file in the working directory
         for file in "$sdir"/*; do
             # parse filename
@@ -176,9 +180,9 @@ EOF
             # skip files that dont match the format
             if ! [[ "$base" =~ $_mine ]]; then continue; fi
             # parse filename
-            IFS='_' read id tags <<< "$base"
+            IFS='_' read -r id tags <<< "$base"
             # filter by time selection
-            if [ -n "$exact" ]  && [ "$id" != "$exact" ]; then continue; fi
+            if [ -n "$exact" ]  && [ "$id" != "$exact" ];   then continue; fi
             if [ -n "$after"  ] && [ "$id" -lt "$after"  ]; then continue; fi
             if [ -n "$before" ] && [ "$id" -gt "$before" ]; then continue; fi
             # filter by tag
@@ -200,8 +204,10 @@ EOF
             for ((x="$len" - 1; x >= 0; x--)); do revs+=("${hits[$x]}"); done
             hits=("${revs[@]}")
         fi
-    fi
+        ;;
+    esac
     # select program mode
+    local hit name path tmp
     case "$mode" in
         # help - write some usage text
         help)
@@ -210,55 +216,96 @@ EOF
             ;;
         # add - make a new entry
         add)
-            # generate file name
-            path="${sdir}/${id:-$now}"
+            # generate file names
+            name="${id:-$now}"
             if [ "${#wtags[@]}" -gt 0 ]; then
-                path+="$(printf '_%s' "${wtags[@]}")";
+                name+="$(printf '_%s' "${wtags[@],,}")";
             fi
-            path="${path,,}"
+            path="$sdir/$name"
+            tmp="/dev/shm/$name"
             # nothing on stdin?
             if [ -t 0 ]; then
-                # edit interactively
-                eval "${EDITOR:-/bin/nano} $path"
+                # edit interactively if possible
+                if ! "$editor" "$tmp"; then return 3; fi
             else
-                # validate input file
-                if [ -d /dev/stdin ]; then
-                    printf "Input is a directory?\n" >&2
-                    return 3
-                fi
                 # write input out to entry
-                while read -r line; do printf "%s\n" "$line"; done > "$path"
+                printf "%s\n" "$(< /dev/stdin)" > "$tmp"
             fi
+            # ensure that a file was made
+            if ! [ -f "$tmp" ]; then return 3; fi
+            # create the new entry
+            if [ -n "$encrypt" ]; then
+                # encrypted
+                path="$path.gpg"
+                gpg -e -q -a < "$tmp" > "$path"
+            else
+                # plaintext
+                printf "%s\n" "$(< "$tmp")" > "$path"
+            fi
+            # clean up
+            rm "$tmp"
             # write out file path
             if [ -f "$path" ]; then printf "%s\n" "$path"; fi
             ;;
-        # get - show file with given index
-        get)
+        # get/edit/delete - manipulate a single entry
+        get|edit|delete)
             # maybe nothing was found
             if [ "${len:-0}" -lt 1 ]; then
                 printf "No entries found!\n" >&2
                 return 2
             fi
-            # accept integer index
+            # accept an integer index
             declare pick="${1:-0}"
             if ! [[ "$pick" =~ $_pos ]]; then
                 printf "Get index must be +/- integer.\n" >&2
                 return 2
             fi
+            # absolute index must be between 0 and the number of entries found
             if [ "${pick#-}" -gt "$(( len - 1 ))" ]; then
                 printf "Max index is %s!\n" "$(( len - 1 ))" >&2
                 return 2
             fi
-            # write out file path or its contents
+            # lookup file by index
             hit="${hits[$pick]}"
-            if [ -n "$simple" ]; then
-                printf "%s\n" "$hit"
-            else
-                file="${hit##*/}"
-                IFS='_' read id tags <<< "$file"
-                printf "%s %(%F %T)T %s\n" "$id" "$id" "${tags//_/,}" >&2
-                while read -r line; do printf "%s\n" "$line"; done < "${hits[$pick]}"
-            fi
+            # switch on mode
+            case "$mode" in
+                delete)
+                    # delete that file
+                    rm -i -v "$hit"
+                    ;;
+                edit)
+                    # optionally decrypt the entry
+                    tmp="$hit"
+                    if [[ "$hit" == *.gpg ]]; then
+                        encrypt="yes"
+                        tmp="/dev/shm/${hit##*/}"
+                        tmp="${tmp%%.gpg}"
+                        gpg -d -q < "$hit" > "$tmp"
+                    fi
+                    # edit the entry
+                    if ! "$editor" "$tmp"; then return 3; fi
+                    # maybe re-encrypt
+                    if [ -n "$encrypt" ]; then
+                        gpg -e -q -a < "$tmp" > "${hit%%.gpg}.gpg"
+                        rm "$tmp"
+                    fi
+                    # write out file path
+                    printf "%s\n" "$hit"
+                    ;;
+                get)
+                    # for simple output just write the path
+                    if [ -n "$simple" ]; then
+                        printf "%s\n" "$hit"
+                        return
+                    fi
+                    # write file contents, decrypting if necessary
+                    if [[ "$hit" == *.gpg ]]; then
+                        gpg -q -d < "$hit"
+                    else
+                        printf "%s\n" "$(< "$hit")"
+                    fi
+                    ;;
+            esac
             ;;
         # list - list matching entries
         list)
@@ -267,23 +314,20 @@ EOF
                 printf "No entries found!\n" >&2
                 return 2
             fi
-            declare index="0"
+            # print each entry
+            local index=0
             for hit in "${hits[@]}"; do
                 if [ -n "$simple" ]; then
                     # simple format: FILENAME
                     printf "%s\n" "$hit"
                 else
-                    # default format: INDEX ID TIMESTAMP PREVIEW
-                    declare len info
-                    # parse file name for normal output
-                    file="${hit##*/}"
-                    IFS='_' read id tags <<< "$file"
-                    # render entry info
-                    stamp="$(printf '%(%F %T)T' "$id")"
-                    printf "% 3d %d %s %s %s %s\n" \
-                           "$index" "$id" "$stamp" "${tags//_/,}"
+                    # split file for attributes
+                    name="${hit##*/}"
+                    IFS='_' read -r id tags <<< "${name%%.*}"
+                    # render entry info - INDEX ID TIMESTAMP PREVIEW
+                    printf "% 3d %s %(%F %T)T %s %s %s\n" \
+                           "$index" "$id" "$id" "${tags//_/,}"
                 fi
-                # increment index
                 let index++;
             done
             ;;
@@ -296,13 +340,62 @@ EOF
             done
             printf "%s\n" "${!all[@]}" | sort
             ;;
-
-        *) # something else?
-            printf "Invalid mode '%s'. How did that happen?" "$mode" >&2
-            return 5
-            ;;
     esac
     return 0;
 }
+
+# _scrawl - command completion for scrawl
+_scrawl() {
+    # scrawl has some modes
+    declare -a modes
+    modes=(-{A,D,G,L,T})
+    # scrawl has some options
+    declare -A opts
+    for opt in -{a,b,d,e,h,i,r,s,t}; do opts["$opt"]=0; done
+    # scan all previous words
+    local mode=""
+    for word in "${COMP_WORDS[@]}"; do
+        case "$word" in
+            -A|-D|-G|-L|-T) mode="$word" ;;
+            -a|-b|-d|-e|-h|-i|-r|-s) unset opts["$word"] ;;
+        esac
+    done
+    local cur="${COMP_WORDS[COMP_CWORD]}"
+    # first maybe consider the previous word
+    if [[ "$COMP_CWORD" -gt 1 ]]; then
+        case "${COMP_WORDS[COMP_CWORD-1]}" in
+            -a|-b|-d)
+                # for date options try to be helpful
+                if [ -z "$cur" ]; then COMPREPLY=("\$(date +%s)"); fi
+                return
+                ;;
+            -i) # for ID option
+                declare -a ids
+                while read -r _ i _; do ids+=("$i"); done < <(scrawl -L)
+                COMPREPLY=($(compgen -W "${ids[*]}" -- "$cur"))
+                return
+                ;;
+            -t) # for tag option complete on all tags
+                mapfile tags < <(scrawl -T)
+                COMPREPLY=($(compgen -W "${tags[*]} " -- "$cur"))
+                return
+                ;;
+        esac
+    fi
+    # figure possible next words
+    declare -a next
+    # modes if one has not been given already
+    if [ -z "$mode" ]; then
+        next+=("${modes[@]}")
+    fi
+    # options
+    if :; then # unless past option processing?
+        next+=("${!opts[@]}")
+    fi
+    # complete on next tokens
+    COMPREPLY=($(compgen -S' ' -W "${next[*]}" -- "$cur"))
+}
+complete -F _scrawl scrawl
+
 # run it unless sourced
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then scrawl "$@"; fi
