@@ -1,13 +1,146 @@
 #!/bin/bash
 # scrawl - Tagged temporary files.
 
+ts() { printf "%(${1:-%s})T\n" "${2:--1}"; }
+
+ti() {
+    # usage
+    read -r -d '' use <<EOF
+USAGE: ti [OPTIONS] INTERVAL
+Parse and render temporal shorthand.
+
+UNITS:                  | SCALES:
+ s : second  d : day    |  D : 10e1  M : 10e6
+ m : minute  w : week   |  H : 10e2  G : 10e9
+ h : hour    y : year   |  K : 10e3  T : 10e12
+
+MODES
+ -n : numeric   : output integer number of seconds in INTERVAL
+ -s : shorthand : output string shorthand of INTERVAL
+ -a : after     : output date plus INTERVAL
+ -b : before    : output date minus INTERVAL
+
+OPTIONS
+ -d TIME   : calculate dates relative to TIME
+ -f FORMAT : render dates with printf using FORMAT
+
+SAMPLE
+ 1d        : 86400 | 1Ms    : 1000000
+ 43m20s    : 2600  | 3Kh    : 259200000
+ 18h12m16s : 65536 | 2Gy    : 63115200000000000
+
+EOF
+    # mark current time
+    local now
+    now=$(ts %s)
+    # time scales
+    declare -A scale
+    scale=(
+        ["D"]=$((10**1))
+        ["H"]=$((10**2))
+        ["K"]=$((10**3))
+        ["M"]=$((10**6))
+        ["G"]=$((10**9))
+        ["T"]=$((10**12))
+    )
+    # time units
+    declare -A unit
+    unit=(
+        ["y"]=31557600
+        ["w"]=604800
+        ["d"]=86400
+        ["h"]=3600
+        ["m"]=60
+        ["s"]=1
+    )
+    # reverse lookup integer on unit
+    local revu
+    declare -A revu
+    for key in "${!unit[@]}"; do revu["${unit[$key]}"]="$key"; done
+    # accept options
+    local mode=2 fmt="%s" when="$now"
+    local opt OPTIND OPTARG
+    while getopts ":abd:f:hns" opt; do
+        case "$opt" in
+            # program mode
+            a) mode=4 ;; # date after given interval
+            b) mode=3 ;; # date before given interval
+            n) mode=2 ;; # number of seconds in given interval
+            s) mode=1 ;; # shorthand string for given interval
+            # relative epoch for date calculation
+            d) when="$OPTARG" ;;
+            # format string for date output
+            f) fmt="$OPTARG" ;;
+            h) # help
+                printf "%s\n" "$use" >&2
+                return
+                ;;
+            ?) # invalid?
+                printf "Invalid option '%s'\n%s\n" "$OPTARG" "$use" >&2
+                return 1
+                ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    # accept arguments
+    local inp="$*"
+    if [ -z "$inp" ]; then
+        printf "%s\n" "$use" >&2
+        return
+    fi
+    # decode input string into integer seconds
+    local num="" char="" secs=0 mul=1 idx=0
+    while read -r -n1 char; do
+        let idx++
+        case "$char" in
+            " ")
+                # ignore whitespace
+                continue
+                ;;
+            [0-9])
+                # digit
+                num="${num}${char}"
+                ;;
+            ["$(printf "%s" "${!scale[@]}")"])
+                # unit of scale
+                mul="${scale[$char]}"
+                ;;
+            ["$(printf "%s" "${!unit[@]}")"])
+                # unit of time
+                num="${num:-1}"
+                secs=$(( secs + (num * mul * unit["$char"]) ))
+                num=""
+                mul=1
+                ;;
+            ?)
+                printf "Failed to parse character '%s' at '%d'.\n" "$char" "$idx"
+                return 2
+            ;;
+        esac
+    done <<< "$inp"
+    if [ -n "$num" ]; then secs=$(( secs + num )); fi
+    # encode an interval string
+    local tstr="" left="$secs" per=0
+    while read -r val; do
+        per=$((left / val))
+        left=$((left % val))
+        if [[ "$per" -eq 0 ]]; then continue; fi
+        tstr+="${per}${revu[$val]}"
+    done < <(printf "%s\n" "${unit[@]}" | sort -r -n)
+    # output
+    case "$mode" in
+        1) printf "%s\n" "$tstr" ;;
+        2) printf "%d\n" "$secs" ;;
+        3) ts "$fmt" $(( when - secs )) ;;
+        4) ts "$fmt" $(( when + secs )) ;;
+    esac
+}
+
 scrawl() {
     # usage
     read -r -d '' use <<EOF
 USAGE: scrawl [MODE] [OPTIONS]
-Create and manipulate tagged temporary files.
-Each entry is identified by an integer and zero or more tags.
-IDs are the current epoch time by default but can be any integer.
+Organize your text snippets with tagged temporary files.
 
 MODES
   -A [TAG ...]       | add     | Add new entry with given tags.
@@ -18,14 +151,15 @@ MODES
   -T [TAG ...]       | tags    | List all tags in matching entries.
 
 OPTIONS
-  -a [UNIXTIME] | after   | Filter entries by IDs after the given unix time.
-  -b [UNIXTIME] | before  | Filter entries by IDs before the given unix time.
-  -d [UNIXTIME] | day     | Filter entries by ID 12h before and after the given unix time.
+  -a EPOCHTIME  | after   | Select entries with ID after the given epoch time.
+  -b EPOCHTIME  | before  | Select entries with ID before the given epoch time.
   -e            | encrypt | Encrypt a file with PGP.
-  -i INTEGER    | id      | Filter entries or make a new entry with the given ID.
+  -i INTEGER    | id      | Select entries or make a new entry with the given ID.
   -r            | reverse | Reverse entry ID sort order.
   -s            | simple  | Output only the file name of matching entries.
-  -t TAG_STRING | tag     | Filter entries or make a new entry with the given tag.
+  -t TAG        | tag     | Filter entries or make a new entry with the given tag.
+  -y INTERVAL   | younger | Select entries files younger the given interval.
+  -z INTERVAL   | older   | Select entries older than the given interval.
 
 EXAMPLES
  # Add entries
@@ -39,7 +173,6 @@ EXAMPLES
  # List entries
   $ scrawl -L -t baz
   $ scrawl -L -s foo | parallel grep -l ietf
-  $ scrawl -Ls -d 1572047858 | xargs rm -v
 
  # List tags
   $ scrawl -T foo
@@ -53,16 +186,16 @@ EOF
     fi
     # record the current time
     local now
-    now=$(printf "%(%s)T\n")
+    now=$(ts)
     # local
     local editor="${EDITOR:-/usr/bin/sensible-editor}"
     # regular expressions
     local _int='^[0-9]+$'                                   # INTEGER
     local _pos='^[+-]?[0-9]+$'                              # +/-INTEGER
     local _tag='^[a-Z][a-Z0-9]*$'                           # TAG
-    local _mine='^[0-9]+(_[a-Z][a-Z0-9]+)*([.][a-Z0-9]+)*$' # INTEGER(_TAG)*
+    local _mine='^[0-9]+(_[a-Z][a-Z0-9]+)*$' # INTEGER(_TAG)*
     # declare some variables
-    local mode exact reverse simple after before given encrypt
+    local mode exact reverse simple after before encrypt
     declare -a wtags
     # guess the program mode
     if ! [ -t 0 ]; then
@@ -80,7 +213,7 @@ EOF
     fi
     # accept options
     local opt OPTIND OPTARG
-    while getopts ":ADEGHLTa:b:d:ehi:rst:" opt; do
+    while getopts ":ADEGHLTa:b:ehi:rst:y:z:" opt; do
         case "$opt" in
             # modes
             H|h) mode="help"   ;;
@@ -105,15 +238,6 @@ EOF
                     return 2
                 fi
                 ;;
-            d) ## day - select entries with IDs within today's epoch day
-                given="$OPTARG"
-                if ! [[ "$given" =~ $_int ]]; then
-                    printf "Day filter must be an integer epoch time.\n" >&2
-                    return 2
-                fi
-                after="$(( given - (86400 / 2) ))"
-                before="$(( given + (86400 / 2) ))"
-                ;;
             e) ## encrypt
                 encrypt="YES"
                 ;;
@@ -137,6 +261,18 @@ EOF
                 fi
                 wtags+=("$OPTARG")
                 ;;
+            y) # select files younger than the given interval
+                if ! after=$(ti -b "$OPTARG"); then
+                    printf "Could not parse '%s' as a time interval.\n" "$OPTARG" >&2
+                    return 3
+                fi
+                ;;
+            z) # select files older than than the given interval
+                if ! before=$(ti -b "$OPTARG"); then
+                    printf "Could not parse '%s' as a time interval.\n" "$OPTARG" >&2
+                    return 3
+                fi
+                ;;
             :) # some options have optional arguments
                 case "$OPTARG" in
                     a) # after now
@@ -155,7 +291,7 @@ EOF
                         ;;
                 esac
                 ;;
-            # an unexpected option was provided
+            # an unexpected option was given
             \?)
                 printf "Invalid option '%s'!\n%s\n" "$OPTARG" "$use" >&2
                 return 1
@@ -163,7 +299,7 @@ EOF
         esac
     done
     shift $((OPTIND - 1))
-    # some modes accept any additional arguments as wtags
+    # some modes accept any additional arguments as tags
     while [ "$#" -gt 0 ]; do
         if ! [[ "$1" =~ $_tag ]]; then break; fi
         wtags+=("$1")
@@ -171,12 +307,13 @@ EOF
     done
     # some modes filter existing entries
     declare -a hits
-    local len
+    local base="" len=0 found=0
     case "$mode" in get|edit|delete|list|tags)
         # consider each file in the working directory
         for file in "$sdir"/*; do
             # parse filename
-            local base="${file##*/}"
+            base="${file##*/}"
+            base="${base%%\.*}"
             # skip files that dont match the format
             if ! [[ "$base" =~ $_mine ]]; then continue; fi
             # parse filename
@@ -186,7 +323,7 @@ EOF
             if [ -n "$after"  ] && [ "$id" -lt "$after"  ]; then continue; fi
             if [ -n "$before" ] && [ "$id" -gt "$before" ]; then continue; fi
             # filter by tag
-            local found=0
+            found=0
             for tag in ${tags//_/ }; do
                 for wtag in "${wtags[@]}"; do
                     if [ "${wtag,,}" == "${tag,,}" ]; then found=1; fi
@@ -217,7 +354,7 @@ EOF
         # add - make a new entry
         add)
             # generate file names
-            name="${id:-$now}"
+            name="${exact:-$now}"
             if [ "${#wtags[@]}" -gt 0 ]; then
                 name+="$(printf '_%s' "${wtags[@],,}")";
             fi
@@ -233,7 +370,7 @@ EOF
             fi
             # ensure that a file was made
             if ! [ -f "$tmp" ]; then return 3; fi
-            # create the new entry
+            # create the fnew entry
             if [ -n "$encrypt" ]; then
                 # encrypted
                 path="$path.gpg"
@@ -243,7 +380,7 @@ EOF
                 printf "%s\n" "$(< "$tmp")" > "$path"
             fi
             # clean up
-            rm "$tmp"
+            command rm "$tmp"
             # write out file path
             if [ -f "$path" ]; then printf "%s\n" "$path"; fi
             ;;
@@ -324,9 +461,10 @@ EOF
                     # split file for attributes
                     name="${hit##*/}"
                     IFS='_' read -r id tags <<< "${name%%.*}"
-                    # render entry info - INDEX ID TIMESTAMP PREVIEW
-                    printf "% 3d %s %(%F %T)T %s %s %s\n" \
-                           "$index" "$id" "$id" "${tags//_/,}"
+                    age=$(( now - id ))
+                    # render entry info - INDEX ID TIMESTAMP AGE TAGS
+                    printf "% 4d %s %(%F %T)T %s %s %s\n" \
+                           "$index" "$id" "$id" "$(ti -s "$age")" "${tags//_/,}"
                 fi
                 let index++;
             done
@@ -335,8 +473,11 @@ EOF
         tags)
             declare -A all
             for hit in "${hits[@]}"; do
-                IFS='_' read -r -a t <<< "$hit"
-                for t in "${t[@]:1}"; do all["${t,,}"]+=1; done
+                base="${hit##*/}"
+                IFS='_' read -r -a each <<< "${base%%.*}"
+                for tag in "${each[@]:1}"; do
+                    all["${tag,,}"]+=1
+                done
             done
             printf "%s\n" "${!all[@]}" | sort
             ;;
@@ -350,6 +491,7 @@ _scrawl() {
     declare -a modes
     modes=(-{A,D,G,L,T})
     # scrawl has some options
+    local opt=""
     declare -A opts
     for opt in -{a,b,d,e,h,i,r,s,t}; do opts["$opt"]=0; done
     # scan all previous words
@@ -357,25 +499,25 @@ _scrawl() {
     for word in "${COMP_WORDS[@]}"; do
         case "$word" in
             -A|-D|-G|-L|-T) mode="$word" ;;
-            -a|-b|-d|-e|-h|-i|-r|-s) unset opts["$word"] ;;
+            -a|-b|-e|-h|-i|-r|-s|-y|-z) unset opts["$word"] ;;
         esac
     done
     local cur="${COMP_WORDS[COMP_CWORD]}"
     # first maybe consider the previous word
     if [[ "$COMP_CWORD" -gt 1 ]]; then
         case "${COMP_WORDS[COMP_CWORD-1]}" in
-            -a|-b|-d)
+            -a|-b)
                 # for date options try to be helpful
                 if [ -z "$cur" ]; then COMPREPLY=("\$(date +%s)"); fi
                 return
                 ;;
-            -i) # for ID option
-                declare -a ids
+            -i) # for exact ID option complete existing IDs
+                local i="" ids=()
                 while read -r _ i _; do ids+=("$i"); done < <(scrawl -L)
                 COMPREPLY=($(compgen -W "${ids[*]}" -- "$cur"))
                 return
                 ;;
-            -t) # for tag option complete on all tags
+            -t) # for tag option complete on existing tags
                 mapfile tags < <(scrawl -T)
                 COMPREPLY=($(compgen -W "${tags[*]} " -- "$cur"))
                 return
@@ -397,5 +539,5 @@ _scrawl() {
 }
 complete -F _scrawl scrawl
 
-# run it unless sourced
+###
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then scrawl "$@"; fi
